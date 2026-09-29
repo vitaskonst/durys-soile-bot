@@ -3,6 +3,7 @@ import asyncio
 import logging
 import tempfile
 import wave
+from dataclasses import dataclass
 import requests
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, Router, F
@@ -21,9 +22,23 @@ TOKEN = os.environ["TOKEN"]
 API_BASE_URL = os.environ["API_BASE_URL"].rstrip("/")
 
 word_limit = 10
-parasite_cur_offset = 0
-mispronounced_cur_offset = 0
-filter_text = None
+
+
+@dataclass
+class ListState:
+    offset: int = 0  # page number, as the API's offset parameter expects
+    filter: str = ""
+
+
+# The page and search filter of each chat's word lists, one per list type, so
+# users paging at the same time do not move each other's lists. Kept in memory
+# only: after a restart, the page buttons of an existing list start again
+# from its first page, unfiltered.
+list_states: dict[tuple[int, str], ListState] = {}
+
+
+def list_state(chat_id: int, word_type: str) -> ListState:
+    return list_states.setdefault((chat_id, word_type), ListState())
 
 # The last voice message sent to each chat. It is deleted before the next one
 # is sent, so Telegram's player never queues earlier clips after the new one.
@@ -44,11 +59,10 @@ async def start(message: Message):
 
 @router.message(Command("parasite_words"))
 async def list_parasite_words(message: Message):
-    global parasite_cur_offset, filter_text
-    filter_text = " ".join(message.text.split()[1:])
-    parasite_cur_offset = 0
-
-    parasite_markup = await parasite_words_markup(parasite_cur_offset, filter_text)
+    state = list_states[(message.chat.id, "parasite")] = ListState(
+        filter=" ".join(message.text.split()[1:])
+    )
+    parasite_markup = await parasite_words_markup(state.offset, state.filter)
     if parasite_markup:
         await message.answer("Бөгде тіл сөздер:", reply_markup=parasite_markup)
 
@@ -83,11 +97,10 @@ async def parasite_words_markup(offset, filter_text):
 
 @router.message(Command("mispronounced_words"))
 async def list_mispronounced_words(message: Message):
-    global mispronounced_cur_offset, filter_text
-    filter_text = " ".join(message.text.split()[1:])
-    mispronounced_cur_offset = 0
-
-    mispro_markup = await mispronounced_words_markup(mispronounced_cur_offset, filter_text)
+    state = list_states[(message.chat.id, "mispronounced")] = ListState(
+        filter=" ".join(message.text.split()[1:])
+    )
+    mispro_markup = await mispronounced_words_markup(state.offset, state.filter)
     if mispro_markup:
         await message.answer("Жиі қате айтылатын сөздер:", reply_markup=mispro_markup)
 
@@ -130,34 +143,34 @@ async def default_handler(message: Message):
 # CALLBACK QUERY HANDLERS
 @router.callback_query(F.data == "parasite_prev_page")
 async def parasite_prev_page(callback: CallbackQuery):
-    global parasite_cur_offset, filter_text
     await callback.answer()
-    parasite_cur_offset -= 1
-    markup = await parasite_words_markup(parasite_cur_offset, filter_text)
+    state = list_state(callback.message.chat.id, "parasite")
+    state.offset = max(0, state.offset - 1)
+    markup = await parasite_words_markup(state.offset, state.filter)
     await callback.message.edit_text("Бөгде тіл сөздер:", reply_markup=markup)
 
 @router.callback_query(F.data == "parasite_next_page")
 async def parasite_next_page(callback: CallbackQuery):
-    global parasite_cur_offset, filter_text
     await callback.answer()
-    parasite_cur_offset += 1
-    markup = await parasite_words_markup(parasite_cur_offset, filter_text)
+    state = list_state(callback.message.chat.id, "parasite")
+    state.offset += 1
+    markup = await parasite_words_markup(state.offset, state.filter)
     await callback.message.edit_text("Бөгде тіл сөздер:", reply_markup=markup)
 
 @router.callback_query(F.data == "mispro_prev_page")
 async def mispro_prev_page(callback: CallbackQuery):
-    global mispronounced_cur_offset, filter_text
     await callback.answer()
-    mispronounced_cur_offset -= 1
-    markup = await mispronounced_words_markup(mispronounced_cur_offset, filter_text)
+    state = list_state(callback.message.chat.id, "mispronounced")
+    state.offset = max(0, state.offset - 1)
+    markup = await mispronounced_words_markup(state.offset, state.filter)
     await callback.message.edit_text("Жиі қате айтылатын сөздер:", reply_markup=markup)
 
 @router.callback_query(F.data == "mispro_next_page")
 async def mispro_next_page(callback: CallbackQuery):
-    global mispronounced_cur_offset, filter_text
     await callback.answer()
-    mispronounced_cur_offset += 1
-    markup = await mispronounced_words_markup(mispronounced_cur_offset, filter_text)
+    state = list_state(callback.message.chat.id, "mispronounced")
+    state.offset += 1
+    markup = await mispronounced_words_markup(state.offset, state.filter)
     await callback.message.edit_text("Жиі қате айтылатын сөздер:", reply_markup=markup)
 
 async def run(*command: str) -> None:
