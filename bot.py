@@ -3,7 +3,7 @@ import asyncio
 import logging
 import tempfile
 import wave
-from dataclasses import dataclass
+import hashlib
 import requests
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, Router, F
@@ -23,22 +23,19 @@ API_BASE_URL = os.environ["API_BASE_URL"].rstrip("/")
 
 word_limit = 10
 
+# The two word lists: API type and the heading shown above the list. The key
+# is what page buttons carry in their callback data.
+LISTS = {
+    "p": ("parasite", "Бөгде тіл сөздер:"),
+    "m": ("commonly-mispronounced", "Жиі қате айтылатын сөздер:"),
+}
 
-@dataclass
-class ListState:
-    offset: int = 0  # page number, as the API's offset parameter expects
-    filter: str = ""
-
-
-# The page and search filter of each chat's word lists, one per list type, so
-# users paging at the same time do not move each other's lists. Kept in memory
-# only: after a restart, the page buttons of an existing list start again
-# from its first page, unfiltered.
-list_states: dict[tuple[int, str], ListState] = {}
-
-
-def list_state(chat_id: int, word_type: str) -> ListState:
-    return list_states.setdefault((chat_id, word_type), ListState())
+# Page buttons carry their list, page and search filter in their callback
+# data, so a list keeps working across restarts and several lists in a chat
+# never interfere. Telegram limits callback data to 64 bytes; a filter too long
+# to fit is kept here instead, under a short key, and is lost on a restart.
+CALLBACK_DATA_LIMIT = 64
+long_filters: dict[str, str] = {}
 
 # The last voice message sent to each chat. It is deleted before the next one
 # is sent, so Telegram's player never queues earlier clips after the new one.
@@ -46,92 +43,85 @@ def list_state(chat_id: int, word_type: str) -> ListState:
 # previous one in place.
 last_voice: dict[int, int] = {}
 
-# Initialize bot, storage, dispatcher, and router
+# Initialize bot, dispatcher, and router
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 router = Router()
 dp.include_router(router)
+
+
+def page_data(kind: str, offset: int, filter_text: str) -> str:
+    data = f"page:{kind}:{offset}:{filter_text}"
+    if len(data.encode()) <= CALLBACK_DATA_LIMIT:
+        return data
+    key = hashlib.sha1(filter_text.encode()).hexdigest()[:12]
+    long_filters[key] = filter_text
+    return f"pageh:{kind}:{offset}:{key}"
+
+
+def parse_page_data(data: str) -> tuple[str, int, str] | None:
+    """(list, page, filter) from a page button, or None if it can't be served."""
+    try:
+        marker, kind, offset, filter_text = data.split(":", 3)
+        if marker == "pageh":
+            filter_text = long_filters[filter_text]
+        if kind not in LISTS or int(offset) < 0:
+            return None
+        return kind, int(offset), filter_text
+    except (ValueError, KeyError):
+        return None
+
+
+async def words_markup(kind: str, offset: int, filter_text: str):
+    params = {"type": LISTS[kind][0], "offset": offset, "limit": word_limit, "sort": "asc"}
+    if filter_text:
+        params["filter"] = filter_text
+
+    response = requests.get(f"{API_BASE_URL}/words", params=params)
+    if response.status_code != 200:
+        return None
+
+    data = response.json()
+    if not data:
+        return None
+
+    buttons = []
+    for word in data:
+        buttons.append([InlineKeyboardButton(text=word["word"], callback_data=str(word["id"]))])
+
+    previous = InlineKeyboardButton(text="⏪ Артқа", callback_data=page_data(kind, offset - 1, filter_text))
+    following = InlineKeyboardButton(text="Келесі ⏩", callback_data=page_data(kind, offset + 1, filter_text))
+    if offset > 0 and len(data) == word_limit:
+        buttons.append([previous, following])
+    elif offset > 0:
+        buttons.append([previous])
+    elif len(data) == word_limit:
+        buttons.append([following])
+
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
 
 # COMMAND HANDLERS
 @router.message(Command("start"))
 async def start(message: Message):
     await message.answer(f"Сәлем, {message.from_user.first_name}!")
 
+
+async def show_list(message: Message, kind: str):
+    # Anything after the command is a search filter: the words' beginning.
+    markup = await words_markup(kind, 0, " ".join(message.text.split()[1:]))
+    if markup:
+        await message.answer(LISTS[kind][1], reply_markup=markup)
+
+
 @router.message(Command("parasite_words"))
 async def list_parasite_words(message: Message):
-    state = list_states[(message.chat.id, "parasite")] = ListState(
-        filter=" ".join(message.text.split()[1:])
-    )
-    parasite_markup = await parasite_words_markup(state.offset, state.filter)
-    if parasite_markup:
-        await message.answer("Бөгде тіл сөздер:", reply_markup=parasite_markup)
+    await show_list(message, "p")
 
-async def parasite_words_markup(offset, filter_text):
-    url = f"{API_BASE_URL}/words?type=parasite&offset={offset}&limit={word_limit}&sort=asc"
-    if filter_text:
-        url += f"&filter={filter_text}"
-
-    parasite_words = requests.get(url)
-
-    if parasite_words.status_code != 200:
-        return None
-
-    data = parasite_words.json()
-    if not data:
-        return None
-
-    buttons = []
-    for word in data:
-        buttons.append([InlineKeyboardButton(text=word["word"], callback_data=str(word["id"]))])
-
-    if offset > 0 and len(data) == word_limit:
-        buttons.append([InlineKeyboardButton(text="⏪ Артқа", callback_data="parasite_prev_page"),
-                        InlineKeyboardButton(text="Келесі ⏩", callback_data="parasite_next_page")])
-    elif offset > 0:
-        buttons.append([InlineKeyboardButton(text="⏪ Артқа", callback_data="parasite_prev_page")])
-    elif len(data) == word_limit:
-         buttons.append([InlineKeyboardButton(text="Келесі ⏩", callback_data="parasite_next_page")])
-
-    markup = InlineKeyboardMarkup(inline_keyboard=buttons)
-    return markup
 
 @router.message(Command("mispronounced_words"))
 async def list_mispronounced_words(message: Message):
-    state = list_states[(message.chat.id, "mispronounced")] = ListState(
-        filter=" ".join(message.text.split()[1:])
-    )
-    mispro_markup = await mispronounced_words_markup(state.offset, state.filter)
-    if mispro_markup:
-        await message.answer("Жиі қате айтылатын сөздер:", reply_markup=mispro_markup)
-
-async def mispronounced_words_markup(offset, filter_text):
-    url = f"{API_BASE_URL}/words?type=commonly-mispronounced&offset={offset}&limit={word_limit}&sort=asc"
-    if filter_text:
-        url += f"&filter={filter_text}"
-
-    mispronounced_words = requests.get(url)
-
-    if mispronounced_words.status_code != 200:
-        return None
-
-    data = mispronounced_words.json()
-    if not data:
-        return None
-    
-    buttons = []
-    for word in data:
-        buttons.append([InlineKeyboardButton(text=word["word"], callback_data=str(word["id"]))])
-
-    if offset > 0 and len(data) == word_limit:
-        buttons.append([InlineKeyboardButton(text="⏪ Артқа", callback_data="mispro_prev_page"),
-                        InlineKeyboardButton(text="Келесі ⏩", callback_data="mispro_next_page")])
-    elif offset > 0:
-        buttons.append([InlineKeyboardButton(text="⏪ Артқа", callback_data="mispro_prev_page")])
-    elif len(data) == word_limit:
-         buttons.append([InlineKeyboardButton(text="Келесі ⏩", callback_data="mispro_next_page")])
-
-    markup = InlineKeyboardMarkup(inline_keyboard=buttons)
-    return markup
+    await show_list(message, "m")
 
 
 # DEFAULT MESSAGE HANDLER
@@ -145,43 +135,23 @@ async def edit_list(callback: CallbackQuery, text: str, markup) -> None:
     try:
         await callback.message.edit_text(text, reply_markup=markup)
     except TelegramBadRequest as error:
-        # The page did not change, e.g. a list opened before a restart, whose
-        # page the bot no longer remembers. Telegram rejects no-op edits.
+        # The page did not change, e.g. a button pressed twice in a row.
+        # Telegram rejects no-op edits.
         if "message is not modified" not in str(error):
             raise
 
 
-@router.callback_query(F.data == "parasite_prev_page")
-async def parasite_prev_page(callback: CallbackQuery):
+@router.callback_query(F.data.startswith("page:") | F.data.startswith("pageh:"))
+async def turn_page(callback: CallbackQuery):
+    page = parse_page_data(callback.data)
+    if page is None:
+        await expired_button(callback)
+        return
     await callback.answer()
-    state = list_state(callback.message.chat.id, "parasite")
-    state.offset = max(0, state.offset - 1)
-    markup = await parasite_words_markup(state.offset, state.filter)
-    await edit_list(callback, "Бөгде тіл сөздер:", markup)
+    kind, offset, filter_text = page
+    markup = await words_markup(kind, offset, filter_text)
+    await edit_list(callback, LISTS[kind][1], markup)
 
-@router.callback_query(F.data == "parasite_next_page")
-async def parasite_next_page(callback: CallbackQuery):
-    await callback.answer()
-    state = list_state(callback.message.chat.id, "parasite")
-    state.offset += 1
-    markup = await parasite_words_markup(state.offset, state.filter)
-    await edit_list(callback, "Бөгде тіл сөздер:", markup)
-
-@router.callback_query(F.data == "mispro_prev_page")
-async def mispro_prev_page(callback: CallbackQuery):
-    await callback.answer()
-    state = list_state(callback.message.chat.id, "mispronounced")
-    state.offset = max(0, state.offset - 1)
-    markup = await mispronounced_words_markup(state.offset, state.filter)
-    await edit_list(callback, "Жиі қате айтылатын сөздер:", markup)
-
-@router.callback_query(F.data == "mispro_next_page")
-async def mispro_next_page(callback: CallbackQuery):
-    await callback.answer()
-    state = list_state(callback.message.chat.id, "mispronounced")
-    state.offset += 1
-    markup = await mispronounced_words_markup(state.offset, state.filter)
-    await edit_list(callback, "Жиі қате айтылатын сөздер:", markup)
 
 async def run(*command: str) -> None:
     process = await asyncio.create_subprocess_exec(*command, stderr=asyncio.subprocess.PIPE)
@@ -261,6 +231,14 @@ async def send_word_audio(callback: CallbackQuery):
         duration=duration,
     )
     last_voice[chat_id] = sent.message_id
+
+
+@router.callback_query()
+async def expired_button(callback: CallbackQuery):
+    # Buttons this version cannot serve: lists sent by an earlier version of
+    # the bot, or a long filter lost on a restart. Registered last, so it only
+    # catches what no other handler matched.
+    await callback.answer("Бұл тізім ескірген. Команданы қайта жіберіңіз.", show_alert=True)
 
 
 async def main():
