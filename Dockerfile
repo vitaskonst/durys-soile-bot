@@ -6,6 +6,12 @@ ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1
 
+# mpg123 decodes the MP3 clips and opusenc re-encodes them as OGG/Opus voice
+# notes, the only format Telegram draws a voice message's waveform for.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends mpg123 opus-tools \
+    && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /opt/app
 
 COPY requirements.txt ./

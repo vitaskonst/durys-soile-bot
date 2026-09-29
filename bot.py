@@ -1,13 +1,14 @@
 import os
 import asyncio
 import logging
-import tempfile 
+import tempfile
+import wave
 import requests
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, Router, F
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command
-from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, FSInputFile, InputMediaAudio, InputMediaDocument
-from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, BufferedInputFile
 
 load_dotenv()
 # aiogram reports polling problems (a revoked token, a second instance with
@@ -22,9 +23,13 @@ API_BASE_URL = os.environ["API_BASE_URL"].rstrip("/")
 word_limit = 10
 parasite_cur_offset = 0
 mispronounced_cur_offset = 0
-last_audio_id = None
 filter_text = None
-is_last_msg_voice = False
+
+# The last voice message sent to each chat. It is deleted before the next one
+# is sent, so Telegram's player never queues earlier clips after the new one.
+# Kept in memory only: after a restart, the first clip in a chat leaves the
+# previous one in place.
+last_voice: dict[int, int] = {}
 
 # Initialize bot, storage, dispatcher, and router
 bot = Bot(token=TOKEN)
@@ -36,18 +41,16 @@ dp.include_router(router)
 @router.message(Command("start"))
 async def start(message: Message):
     await message.answer(f"Сәлем, {message.from_user.first_name}!")
-    is_last_msg_voice = False
 
 @router.message(Command("parasite_words"))
 async def list_parasite_words(message: Message):
-    global parasite_cur_offset, filter_text, is_last_msg_voice
+    global parasite_cur_offset, filter_text
     filter_text = " ".join(message.text.split()[1:])
     parasite_cur_offset = 0
 
     parasite_markup = await parasite_words_markup(parasite_cur_offset, filter_text)
     if parasite_markup:
         await message.answer("Бөгде тіл сөздер:", reply_markup=parasite_markup)
-        is_last_msg_voice = False
 
 async def parasite_words_markup(offset, filter_text):
     url = f"{API_BASE_URL}/words?type=parasite&offset={offset}&limit={word_limit}&sort=asc"
@@ -80,14 +83,13 @@ async def parasite_words_markup(offset, filter_text):
 
 @router.message(Command("mispronounced_words"))
 async def list_mispronounced_words(message: Message):
-    global mispronounced_cur_offset, filter_text, is_last_msg_voice
+    global mispronounced_cur_offset, filter_text
     filter_text = " ".join(message.text.split()[1:])
     mispronounced_cur_offset = 0
 
     mispro_markup = await mispronounced_words_markup(mispronounced_cur_offset, filter_text)
     if mispro_markup:
         await message.answer("Жиі қате айтылатын сөздер:", reply_markup=mispro_markup)
-        is_last_msg_voice = False
 
 async def mispronounced_words_markup(offset, filter_text):
     url = f"{API_BASE_URL}/words?type=commonly-mispronounced&offset={offset}&limit={word_limit}&sort=asc"
@@ -122,98 +124,121 @@ async def mispronounced_words_markup(offset, filter_text):
 # DEFAULT MESSAGE HANDLER
 @router.message()
 async def default_handler(message: Message):
-    global is_last_msg_voice
     await message.answer("Сізді түсінбедім(")
-    is_last_msg_voice = False
 
 
 # CALLBACK QUERY HANDLERS
 @router.callback_query(F.data == "parasite_prev_page")
 async def parasite_prev_page(callback: CallbackQuery):
-    global parasite_cur_offset, filter_text, is_last_msg_voice
+    global parasite_cur_offset, filter_text
+    await callback.answer()
     parasite_cur_offset -= 1
     markup = await parasite_words_markup(parasite_cur_offset, filter_text)
     await callback.message.edit_text("Бөгде тіл сөздер:", reply_markup=markup)
-    # is_last_msg_voice = False
 
 @router.callback_query(F.data == "parasite_next_page")
-async def parasite_prev_page(callback: CallbackQuery):
-    global parasite_cur_offset, filter_text, is_last_msg_voice
+async def parasite_next_page(callback: CallbackQuery):
+    global parasite_cur_offset, filter_text
+    await callback.answer()
     parasite_cur_offset += 1
     markup = await parasite_words_markup(parasite_cur_offset, filter_text)
     await callback.message.edit_text("Бөгде тіл сөздер:", reply_markup=markup)
-    # is_last_msg_voice = False
 
 @router.callback_query(F.data == "mispro_prev_page")
-async def parasite_prev_page(callback: CallbackQuery):
-    global mispronounced_cur_offset, filter_text, is_last_msg_voice
+async def mispro_prev_page(callback: CallbackQuery):
+    global mispronounced_cur_offset, filter_text
+    await callback.answer()
     mispronounced_cur_offset -= 1
     markup = await mispronounced_words_markup(mispronounced_cur_offset, filter_text)
     await callback.message.edit_text("Жиі қате айтылатын сөздер:", reply_markup=markup)
-    # is_last_msg_voice = False
 
 @router.callback_query(F.data == "mispro_next_page")
-async def parasite_prev_page(callback: CallbackQuery):
-    global mispronounced_cur_offset, filter_text, is_last_msg_voice
+async def mispro_next_page(callback: CallbackQuery):
+    global mispronounced_cur_offset, filter_text
+    await callback.answer()
     mispronounced_cur_offset += 1
     markup = await mispronounced_words_markup(mispronounced_cur_offset, filter_text)
     await callback.message.edit_text("Жиі қате айтылатын сөздер:", reply_markup=markup)
-    # is_last_msg_voice = False
+
+async def run(*command: str) -> None:
+    process = await asyncio.create_subprocess_exec(*command, stderr=asyncio.subprocess.PIPE)
+    _, stderr = await process.communicate()
+    if process.returncode:
+        raise RuntimeError(f"{command[0]} failed: {stderr.decode(errors='replace').strip()}")
+
+
+async def to_voice(mp3: bytes) -> tuple[bytes, int]:
+    """Re-encode an MP3 clip as a mono OGG/Opus voice note.
+
+    Telegram draws a voice message's waveform only for OGG/Opus; an MP3 sent
+    as a voice message shows a flat line. Returns (ogg bytes, duration in
+    whole seconds).
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        mp3_path, wav_path, ogg_path = (os.path.join(tmp, name) for name in ("in.mp3", "in.wav", "out.ogg"))
+        with open(mp3_path, "wb") as f:
+            f.write(mp3)
+        await run("mpg123", "--quiet", "--mono", "-w", wav_path, mp3_path)
+        # mpg123 exits 0 on input it cannot decode, just without writing.
+        if not os.path.exists(wav_path):
+            raise RuntimeError("mpg123 could not decode the clip")
+        with wave.open(wav_path) as w:
+            duration = max(1, round(w.getnframes() / w.getframerate()))
+        await run("opusenc", "--quiet", "--bitrate", "48", wav_path, ogg_path)
+        with open(ogg_path, "rb") as f:
+            return f.read(), duration
+
 
 @router.callback_query(F.data.isdigit())
-async def parasite_prev_page(callback: CallbackQuery):
-    global last_audio_id, is_last_msg_voice
+async def send_word_audio(callback: CallbackQuery):
+    # Acknowledge the press at once, or Telegram keeps the button spinning.
+    await callback.answer()
+    chat_id = callback.message.chat.id
     word_id = callback.data
-    audio = requests.get(f"{API_BASE_URL}/audio/{word_id}")
-    if audio.status_code != 200:
-        await callback.message.answer("Error!")
-        is_last_msg_voice = False
-        return
 
+    audio = requests.get(f"{API_BASE_URL}/audio/{word_id}")
     word = requests.get(f"{API_BASE_URL}/words/{word_id}")
-    if word.status_code != 200:
+    if audio.status_code != 200 or word.status_code != 200:
         await callback.message.answer("Error!")
-        is_last_msg_voice = False
         return
 
     word_data = word.json()
     # Only parasite words carry correctVersions; the API omits the key for
-    # commonly mispronounced ones.
+    # commonly mispronounced ones. Usage examples are omitted when absent.
     if word_data.get("correctVersions"):
         correct_version = word_data["correctVersions"][0]
-        audio_text = (
-            f"❌ {word_data['word']}\n✅ {correct_version['word']}\n\n"
-            f"❌ {correct_version['incorrectUsage']}\n"
-            f"✅ {correct_version['correctUsage']}"
-        )
+        audio_text = f"❌ {word_data['word']}\n✅ {correct_version['word']}"
+        if correct_version.get("incorrectUsage") or correct_version.get("correctUsage"):
+            audio_text += "\n"
+            if correct_version.get("incorrectUsage"):
+                audio_text += f"\n❌ {correct_version['incorrectUsage']}"
+            if correct_version.get("correctUsage"):
+                audio_text += f"\n✅ {correct_version['correctUsage']}"
     else:
         audio_text = f"🎧 {word_data['word']}"
 
-    # if last_audio_id:
-    #     await bot.delete_message(callback.message.chat.id, last_audio_id)
-    with tempfile.NamedTemporaryFile(delete=True) as temp_file:
-        temp_file.write(audio.content)
-        temp_file.seek(0)
-        audio_file = FSInputFile(temp_file.name)
-        # if is_last_msg_voice:
-        #     # await bot.delete_message(chat_id=callback.message.chat.id, message_id=last_audio_id)
-        #     # sent_audio = await bot.send_audio(chat_id=callback.message.chat.id, 
-        #     #                                 audio=audio_file, 
-        #     #                                 caption=audio_text)
-        #     # last_audio_id = sent_audio.message_id
-        #     await bot.edit_message_media(chat_id=callback.message.chat.id, 
-        #                                     message_id=last_audio_id,
-        #                                     media=InputMediaAudio(media=audio_file))
-        #     await bot.edit_message_caption(chat_id=callback.message.chat.id, 
-        #                                     message_id=last_audio_id,
-        #                                     caption=audio_text,)
-        # else:
-        sent_audio = await bot.send_voice(chat_id=callback.message.chat.id, 
-                                            voice=audio_file, 
-                                            caption=audio_text)
-        last_audio_id = sent_audio.message_id
-    is_last_msg_voice = True
-        
+    try:
+        voice, duration = await to_voice(audio.content)
+    except (RuntimeError, OSError, wave.Error):
+        logging.exception("could not convert the clip of word %s", word_id)
+        await callback.message.answer("Error!")
+        return
+
+    previous = last_voice.pop(chat_id, None)
+    if previous:
+        try:
+            await bot.delete_message(chat_id=chat_id, message_id=previous)
+        except TelegramBadRequest:
+            pass  # already deleted by the user, or too old to delete
+
+    sent = await bot.send_voice(
+        chat_id=chat_id,
+        voice=BufferedInputFile(voice, filename=f"{word_id}.ogg"),
+        caption=audio_text,
+        duration=duration,
+    )
+    last_voice[chat_id] = sent.message_id
+
 
 async def main():
     await dp.start_polling(bot)
