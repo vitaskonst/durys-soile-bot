@@ -43,3 +43,8 @@ working directory.
 Run a single instance per token: Telegram delivers each update to one
 poller, and a second one makes both fail with
 `Conflict: terminated by other getUpdates request`.
+
+To run a second bot on the same host, such as a staging bot with its own
+token, use a separate checkout and set `COMPOSE_PROJECT_NAME` in its `.env`
+(see `.env.example`). Otherwise both share one compose project, and starting
+one replaces the other's container.

@@ -83,14 +83,28 @@ def parse_page_data(data: str) -> tuple[str, int, str] | None:
         return None
 
 
+class ApiUnavailable(Exception):
+    pass
+
+
+API_UNAVAILABLE = "Сөздерді алу мүмкін болмады. Кейінірек қайталап көріңіз."
+
+
 async def words_markup(kind: str, offset: int, filter_text: str):
+    """The page's buttons, or None if the page has no words.
+
+    Raises ApiUnavailable if the API cannot be reached or fails.
+    """
     params = {"type": LISTS[kind][0], "offset": offset, "limit": word_limit, "sort": "asc"}
     if filter_text:
         params["filter"] = filter_text
 
-    response = requests.get(f"{API_BASE_URL}/words", params=params)
+    try:
+        response = requests.get(f"{API_BASE_URL}/words", params=params, timeout=15)
+    except requests.RequestException as error:
+        raise ApiUnavailable(str(error)) from error
     if response.status_code != 200:
-        return None
+        raise ApiUnavailable(f"GET /words answered {response.status_code}")
 
     data = response.json()
     if not data:
@@ -120,9 +134,22 @@ async def start(message: Message):
 
 async def show_list(message: Message, kind: str):
     # Anything after the command is a search filter: the words' beginning.
-    markup = await words_markup(kind, 0, " ".join(message.text.split()[1:]))
-    if markup:
-        await message.answer(LISTS[kind][1], reply_markup=markup)
+    filter_text = " ".join(message.text.split()[1:])
+    try:
+        markup = await words_markup(kind, 0, filter_text)
+    except ApiUnavailable:
+        logging.exception("could not list words")
+        await message.answer(API_UNAVAILABLE)
+        return
+
+    if markup is None:
+        if filter_text:
+            await message.answer(f"«{filter_text}» деп басталатын сөз табылмады.")
+        else:
+            await message.answer("Тізім бос.")
+        return
+
+    await message.answer(LISTS[kind][1], reply_markup=markup)
 
 
 @router.message(Command("parasite_words"))
@@ -158,9 +185,19 @@ async def turn_page(callback: CallbackQuery):
     if page is None:
         await expired_button(callback)
         return
-    await callback.answer()
     kind, offset, filter_text = page
-    markup = await words_markup(kind, offset, filter_text)
+    try:
+        markup = await words_markup(kind, offset, filter_text)
+    except ApiUnavailable:
+        logging.exception("could not list words")
+        await callback.answer(API_UNAVAILABLE, show_alert=True)
+        return
+    if markup is None:
+        # Only reachable through an outdated list, e.g. after words were deleted.
+        await callback.answer("Бұл бетте сөз қалмады.", show_alert=True)
+        return
+
+    await callback.answer()
     await edit_list(callback, LISTS[kind][1], markup)
 
 
