@@ -141,13 +141,23 @@ async def default_handler(message: Message):
 
 
 # CALLBACK QUERY HANDLERS
+async def edit_list(callback: CallbackQuery, text: str, markup) -> None:
+    try:
+        await callback.message.edit_text(text, reply_markup=markup)
+    except TelegramBadRequest as error:
+        # The page did not change, e.g. a list opened before a restart, whose
+        # page the bot no longer remembers. Telegram rejects no-op edits.
+        if "message is not modified" not in str(error):
+            raise
+
+
 @router.callback_query(F.data == "parasite_prev_page")
 async def parasite_prev_page(callback: CallbackQuery):
     await callback.answer()
     state = list_state(callback.message.chat.id, "parasite")
     state.offset = max(0, state.offset - 1)
     markup = await parasite_words_markup(state.offset, state.filter)
-    await callback.message.edit_text("Бөгде тіл сөздер:", reply_markup=markup)
+    await edit_list(callback, "Бөгде тіл сөздер:", markup)
 
 @router.callback_query(F.data == "parasite_next_page")
 async def parasite_next_page(callback: CallbackQuery):
@@ -155,7 +165,7 @@ async def parasite_next_page(callback: CallbackQuery):
     state = list_state(callback.message.chat.id, "parasite")
     state.offset += 1
     markup = await parasite_words_markup(state.offset, state.filter)
-    await callback.message.edit_text("Бөгде тіл сөздер:", reply_markup=markup)
+    await edit_list(callback, "Бөгде тіл сөздер:", markup)
 
 @router.callback_query(F.data == "mispro_prev_page")
 async def mispro_prev_page(callback: CallbackQuery):
@@ -163,7 +173,7 @@ async def mispro_prev_page(callback: CallbackQuery):
     state = list_state(callback.message.chat.id, "mispronounced")
     state.offset = max(0, state.offset - 1)
     markup = await mispronounced_words_markup(state.offset, state.filter)
-    await callback.message.edit_text("Жиі қате айтылатын сөздер:", reply_markup=markup)
+    await edit_list(callback, "Жиі қате айтылатын сөздер:", markup)
 
 @router.callback_query(F.data == "mispro_next_page")
 async def mispro_next_page(callback: CallbackQuery):
@@ -171,7 +181,7 @@ async def mispro_next_page(callback: CallbackQuery):
     state = list_state(callback.message.chat.id, "mispronounced")
     state.offset += 1
     markup = await mispronounced_words_markup(state.offset, state.filter)
-    await callback.message.edit_text("Жиі қате айтылатын сөздер:", reply_markup=markup)
+    await edit_list(callback, "Жиі қате айтылатын сөздер:", markup)
 
 async def run(*command: str) -> None:
     process = await asyncio.create_subprocess_exec(*command, stderr=asyncio.subprocess.PIPE)
