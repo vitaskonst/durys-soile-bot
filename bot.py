@@ -189,6 +189,36 @@ async def list_mispronounced_words(message: Message):
     await show_list(message, "m")
 
 
+async def delete_previous_voice(chat_id: int) -> None:
+    """Delete the chat's last clip. Call with voice_locks[chat_id] held."""
+    row = state.execute("SELECT message_id FROM last_voice WHERE chat_id = ?", (chat_id,)).fetchone()
+    if row:
+        try:
+            await bot.delete_message(chat_id=chat_id, message_id=row[0])
+        except TelegramBadRequest:
+            pass  # already deleted by the user, or older than Telegram's 48 hours
+
+
+def remember_voice(chat_id: int, message_id: int) -> None:
+    state.execute(
+        "INSERT OR REPLACE INTO last_voice (chat_id, message_id) VALUES (?, ?)",
+        (chat_id, message_id),
+    )
+
+
+@router.message(F.via_bot.id == bot.id, F.chat.type == "private")
+async def inline_pick_in_chat(message: Message):
+    """A clip the user picked through inline search in the bot's own chat.
+
+    The user sends it, not the bot, but in a private chat a bot may delete
+    incoming messages too, so it replaces the previous clip like one sent
+    by a word button -- and gets no "not understood" reply.
+    """
+    async with voice_locks[message.chat.id]:
+        await delete_previous_voice(message.chat.id)
+        remember_voice(message.chat.id, message.message_id)
+
+
 # DEFAULT MESSAGE HANDLER
 @router.message()
 async def default_handler(message: Message):
@@ -282,23 +312,14 @@ async def send_word_audio(callback: CallbackQuery):
         return
 
     async with voice_locks[chat_id]:
-        row = state.execute("SELECT message_id FROM last_voice WHERE chat_id = ?", (chat_id,)).fetchone()
-        if row:
-            try:
-                await bot.delete_message(chat_id=chat_id, message_id=row[0])
-            except TelegramBadRequest:
-                pass  # already deleted by the user, or older than Telegram's 48 hours
-
+        await delete_previous_voice(chat_id)
         sent = await bot.send_voice(
             chat_id=chat_id,
             voice=BufferedInputFile(voice, filename=f"{word_id}.ogg"),
             caption=audio_text,
             duration=duration,
         )
-        state.execute(
-            "INSERT OR REPLACE INTO last_voice (chat_id, message_id) VALUES (?, ?)",
-            (chat_id, sent.message_id),
-        )
+        remember_voice(chat_id, sent.message_id)
 
 
 # INLINE MODE
