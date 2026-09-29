@@ -9,7 +9,9 @@ from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, C
 from aiogram.fsm.storage.memory import MemoryStorage
 
 load_dotenv()
-TOKEN = os.getenv("TOKEN")
+TOKEN = os.environ["TOKEN"]
+# The backend's base URL, e.g. https://example.org/api/v1.0
+API_BASE_URL = os.environ["API_BASE_URL"].rstrip("/")
 
 word_limit = 10
 parasite_cur_offset = 0
@@ -42,7 +44,7 @@ async def list_parasite_words(message: Message):
         is_last_msg_voice = False
 
 async def parasite_words_markup(offset, filter_text):
-    url = f"http://duryssoile.nu.edu.kz/api/v1.0/words?type=parasite&offset={offset}&limit={word_limit}&sort=asc"
+    url = f"{API_BASE_URL}/words?type=parasite&offset={offset}&limit={word_limit}&sort=asc"
     if filter_text:
         url += f"&filter={filter_text}"
 
@@ -82,7 +84,7 @@ async def list_mispronounced_words(message: Message):
         is_last_msg_voice = False
 
 async def mispronounced_words_markup(offset, filter_text):
-    url = f"http://duryssoile.nu.edu.kz/api/v1.0/words?type=commonly-mispronounced&offset={offset}&limit={word_limit}&sort=asc"
+    url = f"{API_BASE_URL}/words?type=commonly-mispronounced&offset={offset}&limit={word_limit}&sort=asc"
     if filter_text:
         url += f"&filter={filter_text}"
 
@@ -156,20 +158,22 @@ async def parasite_prev_page(callback: CallbackQuery):
 async def parasite_prev_page(callback: CallbackQuery):
     global last_audio_id, is_last_msg_voice
     word_id = callback.data
-    audio = requests.get(f"http://duryssoile.nu.edu.kz/api/v1.0/audio/{word_id}")
+    audio = requests.get(f"{API_BASE_URL}/audio/{word_id}")
     if audio.status_code != 200:
         await callback.message.answer("Error!")
         is_last_msg_voice = False
         return
 
-    word = requests.get(f"http://duryssoile.nu.edu.kz/api/v1.0/words/{word_id}")
+    word = requests.get(f"{API_BASE_URL}/words/{word_id}")
     if word.status_code != 200:
         await callback.message.answer("Error!")
         is_last_msg_voice = False
         return
 
     word_data = word.json()
-    if int(callback.data) < 186:
+    # Only parasite words carry correctVersions; the API omits the key for
+    # commonly mispronounced ones.
+    if word_data.get("correctVersions"):
         correct_version = word_data["correctVersions"][0]
         audio_text = (
             f"❌ {word_data['word']}\n✅ {correct_version['word']}\n\n"
