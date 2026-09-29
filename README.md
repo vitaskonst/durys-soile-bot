@@ -32,6 +32,12 @@ docker compose logs -f bot
 ```
 
 The bot polls Telegram for updates, so it needs outbound HTTPS only; no
-port is published. Run a single instance per token: Telegram delivers each
+port is published.
+
+The little state it keeps (the last voice message sent to each chat, so the
+next one replaces it, and search filters too long for a button) is a SQLite
+file in the `bot_data` volume, so it survives restarts and redeploys. Set
+`STATE_DB` to put it elsewhere; without Docker it is `state.sqlite3` in the
+working directory. Run a single instance per token: Telegram delivers each
 update to one poller, and a second one makes both fail with
 `Conflict: terminated by other getUpdates request`.

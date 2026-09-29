@@ -7,3 +7,10 @@ services:
     restart: unless-stopped
     # TOKEN and API_BASE_URL; see .env.example.
     env_file: .env
+    volumes:
+      # The bot's state (last voice message per chat, long search filters),
+      # so it survives restarts and redeploys.
+      - bot_data:/data
+
+volumes:
+  bot_data:

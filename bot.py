@@ -4,6 +4,8 @@ import logging
 import tempfile
 import wave
 import hashlib
+import sqlite3
+from collections import defaultdict
 import requests
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, Router, F
@@ -20,6 +22,8 @@ logging.basicConfig(
 TOKEN = os.environ["TOKEN"]
 # The backend's base URL, e.g. https://example.org/api/v1.0
 API_BASE_URL = os.environ["API_BASE_URL"].rstrip("/")
+# SQLite file for the little state that has to survive restarts; see below.
+STATE_DB = os.environ.get("STATE_DB", "state.sqlite3")
 
 word_limit = 10
 
@@ -33,15 +37,21 @@ LISTS = {
 # Page buttons carry their list, page and search filter in their callback
 # data, so a list keeps working across restarts and several lists in a chat
 # never interfere. Telegram limits callback data to 64 bytes; a filter too long
-# to fit is kept here instead, under a short key, and is lost on a restart.
+# to fit is stored in the long_filters table instead, under a short key.
 CALLBACK_DATA_LIMIT = 64
-long_filters: dict[str, str] = {}
 
-# The last voice message sent to each chat. It is deleted before the next one
-# is sent, so Telegram's player never queues earlier clips after the new one.
-# Kept in memory only: after a restart, the first clip in a chat leaves the
-# previous one in place.
-last_voice: dict[int, int] = {}
+# State kept across restarts:
+#   last_voice   -- the last voice message sent to each chat. It is deleted
+#                   before the next one is sent, so Telegram's player never
+#                   queues earlier clips after the new one.
+#   long_filters -- search filters too long for a page button's data.
+state = sqlite3.connect(STATE_DB, isolation_level=None)
+state.execute("CREATE TABLE IF NOT EXISTS last_voice (chat_id INTEGER PRIMARY KEY, message_id INTEGER NOT NULL)")
+state.execute("CREATE TABLE IF NOT EXISTS long_filters (key TEXT PRIMARY KEY, filter TEXT NOT NULL)")
+
+# Serialises sending clips within a chat, so two quick taps cannot both see
+# the same previous clip and leave one of the new ones behind.
+voice_locks: defaultdict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
 
 # Initialize bot, dispatcher, and router
 bot = Bot(token=TOKEN)
@@ -55,7 +65,7 @@ def page_data(kind: str, offset: int, filter_text: str) -> str:
     if len(data.encode()) <= CALLBACK_DATA_LIMIT:
         return data
     key = hashlib.sha1(filter_text.encode()).hexdigest()[:12]
-    long_filters[key] = filter_text
+    state.execute("INSERT OR IGNORE INTO long_filters (key, filter) VALUES (?, ?)", (key, filter_text))
     return f"pageh:{kind}:{offset}:{key}"
 
 
@@ -64,11 +74,12 @@ def parse_page_data(data: str) -> tuple[str, int, str] | None:
     try:
         marker, kind, offset, filter_text = data.split(":", 3)
         if marker == "pageh":
-            filter_text = long_filters[filter_text]
+            row = state.execute("SELECT filter FROM long_filters WHERE key = ?", (filter_text,)).fetchone()
+            filter_text = row[0]
         if kind not in LISTS or int(offset) < 0:
             return None
         return kind, int(offset), filter_text
-    except (ValueError, KeyError):
+    except (ValueError, TypeError):  # malformed data, or an unknown filter key
         return None
 
 
@@ -217,27 +228,31 @@ async def send_word_audio(callback: CallbackQuery):
         await callback.message.answer("Error!")
         return
 
-    previous = last_voice.pop(chat_id, None)
-    if previous:
-        try:
-            await bot.delete_message(chat_id=chat_id, message_id=previous)
-        except TelegramBadRequest:
-            pass  # already deleted by the user, or too old to delete
+    async with voice_locks[chat_id]:
+        row = state.execute("SELECT message_id FROM last_voice WHERE chat_id = ?", (chat_id,)).fetchone()
+        if row:
+            try:
+                await bot.delete_message(chat_id=chat_id, message_id=row[0])
+            except TelegramBadRequest:
+                pass  # already deleted by the user, or older than Telegram's 48 hours
 
-    sent = await bot.send_voice(
-        chat_id=chat_id,
-        voice=BufferedInputFile(voice, filename=f"{word_id}.ogg"),
-        caption=audio_text,
-        duration=duration,
-    )
-    last_voice[chat_id] = sent.message_id
+        sent = await bot.send_voice(
+            chat_id=chat_id,
+            voice=BufferedInputFile(voice, filename=f"{word_id}.ogg"),
+            caption=audio_text,
+            duration=duration,
+        )
+        state.execute(
+            "INSERT OR REPLACE INTO last_voice (chat_id, message_id) VALUES (?, ?)",
+            (chat_id, sent.message_id),
+        )
 
 
 @router.callback_query()
 async def expired_button(callback: CallbackQuery):
-    # Buttons this version cannot serve: lists sent by an earlier version of
-    # the bot, or a long filter lost on a restart. Registered last, so it only
-    # catches what no other handler matched.
+    # Buttons this version cannot serve, such as lists sent by an earlier
+    # version of the bot. Registered last, so it only catches what no other
+    # handler matched.
     await callback.answer("Бұл тізім ескірген. Команданы қайта жіберіңіз.", show_alert=True)
 
 

@@ -19,7 +19,11 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY bot.py ./
 
-RUN useradd --create-home --uid 10001 bot
+# The state database lives in a volume mounted here (see docker-compose.yml);
+# the directory must belong to the bot user so it can create the file.
+RUN useradd --create-home --uid 10001 bot \
+    && mkdir /data && chown bot:bot /data
+ENV STATE_DB=/data/state.sqlite3
 USER bot
 
 # TOKEN and API_BASE_URL are supplied at run time (see README.md); nothing
