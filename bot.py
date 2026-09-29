@@ -11,7 +11,10 @@ from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command
-from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, BufferedInputFile
+from aiogram.types import (
+    BotCommand, BufferedInputFile, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup,
+    Message, ReplyKeyboardRemove,
+)
 
 load_dotenv()
 # aiogram reports polling problems (a revoked token, a second instance with
@@ -129,7 +132,9 @@ async def words_markup(kind: str, offset: int, filter_text: str):
 # COMMAND HANDLERS
 @router.message(Command("start"))
 async def start(message: Message):
-    await message.answer(f"Сәлем, {message.from_user.first_name}!")
+    # ReplyKeyboardRemove: clears the reply keyboard an earlier version of the
+    # bot attached to the chat, which Telegram keeps showing until removed.
+    await message.answer(f"Сәлем, {message.from_user.first_name}!", reply_markup=ReplyKeyboardRemove())
 
 
 async def show_list(message: Message, kind: str):
@@ -165,7 +170,9 @@ async def list_mispronounced_words(message: Message):
 # DEFAULT MESSAGE HANDLER
 @router.message()
 async def default_handler(message: Message):
-    await message.answer("Сізді түсінбедім(")
+    # Also what pressing a leftover reply-keyboard button lands on, so remove
+    # that keyboard here too.
+    await message.answer("Сізді түсінбедім(", reply_markup=ReplyKeyboardRemove())
 
 
 # CALLBACK QUERY HANDLERS
@@ -293,7 +300,17 @@ async def expired_button(callback: CallbackQuery):
     await callback.answer("Бұл тізім ескірген. Команданы қайта жіберіңіз.", show_alert=True)
 
 
+# The command menu Telegram shows, set on every start so it always matches the
+# handlers of the running code.
+COMMANDS = [
+    BotCommand(command="start", description="Бастау"),
+    BotCommand(command="parasite_words", description="Бөгде сөздер"),
+    BotCommand(command="mispronounced_words", description="Жиі қате айтылатын сөздер"),
+]
+
+
 async def main():
+    await bot.set_my_commands(COMMANDS)
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
