@@ -1,5 +1,6 @@
 import os
 import asyncio
+import logging
 import tempfile 
 import requests
 from dotenv import load_dotenv
@@ -9,6 +10,11 @@ from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, C
 from aiogram.fsm.storage.memory import MemoryStorage
 
 load_dotenv()
+# aiogram reports polling problems (a revoked token, a second instance with
+# the same token) only through logging, so without this they are invisible.
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s  %(levelname)-7s %(name)s: %(message)s"
+)
 TOKEN = os.environ["TOKEN"]
 # The backend's base URL, e.g. https://example.org/api/v1.0
 API_BASE_URL = os.environ["API_BASE_URL"].rstrip("/")
@@ -80,7 +86,7 @@ async def list_mispronounced_words(message: Message):
 
     mispro_markup = await mispronounced_words_markup(mispronounced_cur_offset, filter_text)
     if mispro_markup:
-        await message.answer("Жиі қолданылатын сөздер:", reply_markup=mispro_markup)
+        await message.answer("Жиі қате айтылатын сөздер:", reply_markup=mispro_markup)
         is_last_msg_voice = False
 
 async def mispronounced_words_markup(offset, filter_text):
@@ -143,7 +149,7 @@ async def parasite_prev_page(callback: CallbackQuery):
     global mispronounced_cur_offset, filter_text, is_last_msg_voice
     mispronounced_cur_offset -= 1
     markup = await mispronounced_words_markup(mispronounced_cur_offset, filter_text)
-    await callback.message.edit_text("Жиі қолданылатын сөздер:", reply_markup=markup)
+    await callback.message.edit_text("Жиі қате айтылатын сөздер:", reply_markup=markup)
     # is_last_msg_voice = False
 
 @router.callback_query(F.data == "mispro_next_page")
@@ -151,7 +157,7 @@ async def parasite_prev_page(callback: CallbackQuery):
     global mispronounced_cur_offset, filter_text, is_last_msg_voice
     mispronounced_cur_offset += 1
     markup = await mispronounced_words_markup(mispronounced_cur_offset, filter_text)
-    await callback.message.edit_text("Жиі қолданылатын сөздер:", reply_markup=markup)
+    await callback.message.edit_text("Жиі қате айтылатын сөздер:", reply_markup=markup)
     # is_last_msg_voice = False
 
 @router.callback_query(F.data.isdigit())
