@@ -1,0 +1,4 @@
+# Only what the image needs; above all, never the .env with the token.
+*
+!requirements.txt
+!bot.py

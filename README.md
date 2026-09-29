@@ -26,6 +26,12 @@ python bot.py
 ## Running with Docker
 
 ```bash
-docker build -t durys-soile-bot .
-docker run -d --restart unless-stopped --env-file .env durys-soile-bot
+cp .env.example .env        # fill in TOKEN and API_BASE_URL
+docker compose up -d --build
+docker compose logs -f bot
 ```
+
+The bot polls Telegram for updates, so it needs outbound HTTPS only; no
+port is published. Run a single instance per token: Telegram delivers each
+update to one poller, and a second one makes both fail with
+`Conflict: terminated by other getUpdates request`.
