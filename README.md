@@ -48,3 +48,12 @@ To run a second bot on the same host, such as a staging bot with its own
 token, use a separate checkout and set `COMPOSE_PROJECT_NAME` in its `.env`
 (see `.env.example`). Otherwise both share one compose project, and starting
 one replaces the other's container.
+
+## Inline search
+
+With inline mode enabled for the bot in @BotFather (`/setinline`), typing
+`@<bot> абай` in any chat lists matching words from both lists, and choosing
+one sends its pronunciation as a voice message. The «🔍 Іздеу» button under
+each list starts such a search in the current chat. Telegram fetches the clip
+itself from `API_BASE_URL` (as OGG/Opus, `?format=opus`), so that URL must be
+reachable from the internet.

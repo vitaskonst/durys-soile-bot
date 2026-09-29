@@ -13,7 +13,7 @@ from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command
 from aiogram.types import (
     BotCommand, BufferedInputFile, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup,
-    InlineQuery, InlineQueryResultAudio, Message, ReplyKeyboardRemove,
+    InlineQuery, InlineQueryResultVoice, Message, ReplyKeyboardRemove,
 )
 
 load_dotenv()
@@ -308,11 +308,12 @@ INLINE_PAGE = 10  # words per list in one page of inline results
 @router.inline_query()
 async def inline_search(query: InlineQuery):
     """Search as you type: "@<bot> абай" in any chat lists matching words from
-    both lists, and choosing one sends its clip as an audio message.
+    both lists, and choosing one sends its clip as a voice message.
 
-    Telegram fetches the clip itself from the API's MP3 URL, so API_BASE_URL
-    must be reachable from the internet. Needs inline mode enabled for the bot
-    in @BotFather (/setinline).
+    Telegram fetches the clip itself from the API, as OGG/Opus
+    (?format=opus; voice results must be in that format), so API_BASE_URL must
+    be reachable from the internet. Needs inline mode enabled for the bot in
+    @BotFather (/setinline).
     """
     text = query.query.strip()
     if not text:
@@ -327,11 +328,12 @@ async def inline_search(query: InlineQuery):
             more = more or len(words) == INLINE_PAGE
             for word in words:
                 correct = word.get("correctVersions")
-                results.append(InlineQueryResultAudio(
+                results.append(InlineQueryResultVoice(
                     id=str(word["id"]),
-                    audio_url=f"{API_BASE_URL}/audio/{word['id']}",
-                    title=word["word"],
-                    performer=f"✅ {correct[0]['word']}" if correct else "Дұрыс сөйле",
+                    voice_url=f"{API_BASE_URL}/audio/{word['id']}?format=opus",
+                    # Voice results show only a title, so a parasite word's
+                    # correct version goes into it.
+                    title=f"{word['word']} → {correct[0]['word']}" if correct else word["word"],
                     caption=word_caption(word),
                 ))
     except ApiUnavailable:
