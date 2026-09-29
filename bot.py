@@ -13,7 +13,7 @@ from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command
 from aiogram.types import (
     BotCommand, BufferedInputFile, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup,
-    Message, ReplyKeyboardRemove,
+    InlineQuery, InlineQueryResultAudio, Message, ReplyKeyboardRemove,
 )
 
 load_dotenv()
@@ -93,12 +93,9 @@ class ApiUnavailable(Exception):
 API_UNAVAILABLE = "Сөздерді алу мүмкін болмады. Кейінірек қайталап көріңіз."
 
 
-async def words_markup(kind: str, offset: int, filter_text: str):
-    """The page's buttons, or None if the page has no words.
-
-    Raises ApiUnavailable if the API cannot be reached or fails.
-    """
-    params = {"type": LISTS[kind][0], "offset": offset, "limit": word_limit, "sort": "asc"}
+def fetch_words(kind: str, offset: int, filter_text: str, limit: int = word_limit) -> list[dict]:
+    """One page of a list (offset is a page number). Raises ApiUnavailable."""
+    params = {"type": LISTS[kind][0], "offset": offset, "limit": limit, "sort": "asc"}
     if filter_text:
         params["filter"] = filter_text
 
@@ -108,8 +105,31 @@ async def words_markup(kind: str, offset: int, filter_text: str):
         raise ApiUnavailable(str(error)) from error
     if response.status_code != 200:
         raise ApiUnavailable(f"GET /words answered {response.status_code}")
+    return response.json()
 
-    data = response.json()
+
+def word_caption(word: dict) -> str:
+    # Only parasite words carry correctVersions; the API omits the key for
+    # commonly mispronounced ones. Usage examples are omitted when absent.
+    if not word.get("correctVersions"):
+        return f"🎧 {word['word']}"
+    correct_version = word["correctVersions"][0]
+    caption = f"❌ {word['word']}\n✅ {correct_version['word']}"
+    if correct_version.get("incorrectUsage") or correct_version.get("correctUsage"):
+        caption += "\n"
+        if correct_version.get("incorrectUsage"):
+            caption += f"\n❌ {correct_version['incorrectUsage']}"
+        if correct_version.get("correctUsage"):
+            caption += f"\n✅ {correct_version['correctUsage']}"
+    return caption
+
+
+async def words_markup(kind: str, offset: int, filter_text: str):
+    """The page's buttons, or None if the page has no words.
+
+    Raises ApiUnavailable if the API cannot be reached or fails.
+    """
+    data = fetch_words(kind, offset, filter_text)
     if not data:
         return None
 
@@ -126,6 +146,8 @@ async def words_markup(kind: str, offset: int, filter_text: str):
     elif len(data) == word_limit:
         buttons.append([following])
 
+    # Puts "@<bot> " into the input field, starting an inline search.
+    buttons.append([InlineKeyboardButton(text="🔍 Іздеу", switch_inline_query_current_chat="")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
@@ -250,20 +272,7 @@ async def send_word_audio(callback: CallbackQuery):
         await callback.message.answer("Error!")
         return
 
-    word_data = word.json()
-    # Only parasite words carry correctVersions; the API omits the key for
-    # commonly mispronounced ones. Usage examples are omitted when absent.
-    if word_data.get("correctVersions"):
-        correct_version = word_data["correctVersions"][0]
-        audio_text = f"❌ {word_data['word']}\n✅ {correct_version['word']}"
-        if correct_version.get("incorrectUsage") or correct_version.get("correctUsage"):
-            audio_text += "\n"
-            if correct_version.get("incorrectUsage"):
-                audio_text += f"\n❌ {correct_version['incorrectUsage']}"
-            if correct_version.get("correctUsage"):
-                audio_text += f"\n✅ {correct_version['correctUsage']}"
-    else:
-        audio_text = f"🎧 {word_data['word']}"
+    audio_text = word_caption(word.json())
 
     try:
         voice, duration = await to_voice(audio.content)
@@ -290,6 +299,47 @@ async def send_word_audio(callback: CallbackQuery):
             "INSERT OR REPLACE INTO last_voice (chat_id, message_id) VALUES (?, ?)",
             (chat_id, sent.message_id),
         )
+
+
+# INLINE MODE
+INLINE_PAGE = 10  # words per list in one page of inline results
+
+
+@router.inline_query()
+async def inline_search(query: InlineQuery):
+    """Search as you type: "@<bot> абай" in any chat lists matching words from
+    both lists, and choosing one sends its clip as an audio message.
+
+    Telegram fetches the clip itself from the API's MP3 URL, so API_BASE_URL
+    must be reachable from the internet. Needs inline mode enabled for the bot
+    in @BotFather (/setinline).
+    """
+    text = query.query.strip()
+    if not text:
+        await query.answer([], cache_time=300)
+        return
+
+    page = int(query.offset) if query.offset.isdigit() else 0
+    results, more = [], False
+    try:
+        for kind in LISTS:
+            words = fetch_words(kind, page, text, limit=INLINE_PAGE)
+            more = more or len(words) == INLINE_PAGE
+            for word in words:
+                correct = word.get("correctVersions")
+                results.append(InlineQueryResultAudio(
+                    id=str(word["id"]),
+                    audio_url=f"{API_BASE_URL}/audio/{word['id']}",
+                    title=word["word"],
+                    performer=f"✅ {correct[0]['word']}" if correct else "Дұрыс сөйле",
+                    caption=word_caption(word),
+                ))
+    except ApiUnavailable:
+        logging.exception("inline search failed")
+        await query.answer([], cache_time=5)
+        return
+
+    await query.answer(results, cache_time=300, next_offset=str(page + 1) if more else "")
 
 
 @router.callback_query()
